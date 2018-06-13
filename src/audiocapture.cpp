@@ -6,6 +6,8 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <future>
+#include <vector>
 
 using namespace std;
 
@@ -53,7 +55,8 @@ static int usage(char *exe) {
     fprintf(stderr, "Usage: %s [options]\n"
             "Options:\n"
             "  [--listdevices]\n"
-            "  [--recordin]\n"
+            "  [--record {--deviceid $deviceid}] # uses default input device if --deviceid is not passed]\n"
+            "  [--recordconv --deviceid-ch0 $deviceid-ch0 --deviceid-ch1 $deviceid-ch1]\n"
             "  [--verbose]\n", exe);
     return 1;
 }
@@ -234,7 +237,7 @@ int record_in(SoundIo* soundio, char* device_id = nullptr) {
     sample_rate = input_device->sample_rates[0].max;
     fmt = input_device->formats[0];
 
-    out_f = fopen("/tmp/recordin.raw", "wb");
+    out_f = fopen(string(string("/tmp/recordconv-") + input_device->name + ".raw").c_str(), "wb");
     if (!out_f) {
         cerr << "unable to open file: " << strerror(errno) << endl;
         ret = 1;
@@ -297,120 +300,15 @@ finally:
     return ret;
 }
 
-static void write_callback(struct SoundIoOutStream *outstream, int frame_count_min, int frame_count_max) {
-    cerr << "write callback" << endl;
-}
-
-static void underflow_callback(struct SoundIoOutStream *outstream) {
-    static int count = 0;
-    cerr << "underflow " << count++ << endl;
-}
-
-int record_out(SoundIo* soundio) {
-    const int RING_BUFFER_DURATION_SECONDS = 30;
-    int ret = 0;
-    int capacity = 0;
-    struct RecordContext rc;
-    struct SoundIoDevice* output_device = nullptr;
-    int sample_rate = 0;
-    SoundIoFormat fmt = SoundIoFormatInvalid;
-    FILE* out_f = nullptr;
-    struct SoundIoInStream *instream = nullptr;
-
-    int device_index = soundio_default_output_device_index(soundio);
-    output_device = soundio_get_output_device(soundio, device_index);
-    if (!output_device) {
-        cerr << "No Output Device Available" << endl;
-        ret = 1;
-        goto finally;
-    }
-
-    if (true) {
-        print_device(output_device, true, true);
-    } else {
-        cerr << "Device: " << output_device->name << endl;
-    }
-
-    if (output_device->probe_error) {
-        cerr << "Unable to probe device: "<< soundio_strerror(output_device->probe_error) << endl;
-        return ret;
-    }
-
-    soundio_device_sort_channel_layouts(output_device);
-
-    sample_rate = output_device->sample_rates[0].max;
-    fmt = output_device->formats[0];
-
-    out_f = fopen("/tmp/recordsys.raw", "wb");
-    if (!out_f) {
-        cerr << "unable to open file: " << strerror(errno) << endl;
-        ret = 1;
-        goto finally;
-    }
-
-    instream = soundio_instream_create(output_device);
-    if (!instream) {
-        cerr <<  "out of memory" << endl;
-        ret = 1;
-        goto finally;
-    }
-    instream->format = fmt;
-    instream->sample_rate = sample_rate;
-    instream->read_callback = read_callback;
-    instream->overflow_callback = overflow_callback;
-    instream->userdata = &rc;
-
-    if ((ret = soundio_instream_open(instream))) {
-        cerr <<  "unable to open input stream: " << soundio_strerror(ret) << endl;
-        goto finally;
-    }
-
-    cerr << instream->layout.name << " " << sample_rate << "Hz "
-         << soundio_format_string(fmt) << " interleaved " << endl;
-
-
-    capacity = RING_BUFFER_DURATION_SECONDS * instream->sample_rate * instream->bytes_per_frame;
-    rc.ring_buffer = soundio_ring_buffer_create(soundio, capacity);
-    if (!rc.ring_buffer) {
-        cerr << "out of memory" << endl;
-        ret = 1;
-        goto finally;
-    }
-
-    if ((ret = soundio_instream_start(instream))) {
-        cerr << "unable to start instream device: " << soundio_strerror(ret) << endl;
-         goto finally;
-    }
-
-    // Read from ring_bugger and write to file
-    while (true) {
-        soundio_flush_events(soundio);
-        sleep(1);
-        int fill_bytes = soundio_ring_buffer_fill_count(rc.ring_buffer);
-        char *read_buf = soundio_ring_buffer_read_ptr(rc.ring_buffer);
-        size_t amt = fwrite(read_buf, 1, fill_bytes, out_f);
-        if ((int)amt != fill_bytes) {
-            fprintf(stderr, "write error: %s\n", strerror(errno));
-            return 1;
-        }
-        soundio_ring_buffer_advance_read_ptr(rc.ring_buffer, fill_bytes);
-    }
-
-finally:
-    soundio_instream_destroy(instream);
-    soundio_device_unref(output_device);
-    return ret;
-}
-
 int main(int argc, char **argv) {
     char* exe = argv[0];
     bool listdevices = false;
     bool verbose = false;
-    bool recordin = false;
+    bool record = false;
     bool recordconv = false;
-    char* device_id_in = nullptr;
-    char* device_id_ch0 = nullptr;
-    char* device_id_ch1 = nullptr;
+    char* deviceid_in = nullptr;
+    char* deviceid_ch0 = nullptr;
+    char* deviceid_ch1 = nullptr;
 
     // sidster: this cmd line argument parsing code is way too clever
     // a.k.a annoying a.k.a complex; handle with care
@@ -419,16 +317,32 @@ int main(int argc, char **argv) {
         if (arg[0] == '-' && arg[1] == '-') {
             if (strcmp(arg, "--listdevices") == 0) {
                 listdevices = true;
-            } else if (strcmp(arg, "--recordin") == 0) {
-                recordin = true;
+            } else if (strcmp(arg, "--record") == 0) {
+                record = true;
                 // find if the optional '--deviceid $deviceid'
                 // argument was passed
-                cout << argc << endl;
                 if(argc >= i+2 && strcmp(argv[++i], "--deviceid") == 0) {
-                    device_id_in = argv[++i];
+                    deviceid_in = argv[++i];
                 }
             } else if (strcmp(arg, "--recordconv") == 0) {
                 recordconv = true;
+                i++;
+                // find if the required arguments '--deviceid-ch0
+                // $deviceid --deviceid-ch1 $deviceid' were passed
+                if (argc < i+4) {
+                    return usage(exe);
+                }
+                for (int j=0; j < 2; j++) {
+                    if (strcmp(argv[i], "--deviceid-ch0") == 0) {
+                        deviceid_ch0 = argv[++i];
+                        i++;
+                    } else if (strcmp(argv[i], "--deviceid-ch1") == 0) {
+                        deviceid_ch1 = argv[++i];
+                        i++;
+                    } else {
+                        return usage(exe);
+                    }
+                }
             } else if (strcmp(arg, "--verbose") == 0) {
                 verbose = true;
             } else {
@@ -472,15 +386,23 @@ int main(int argc, char **argv) {
         goto finally;
     }
 
-    // RECORD IN
-    if (recordin) {
-        ret = record_in(soundio, device_id_in);
+    // RECORD
+    if (record) {
+        ret = record_in(soundio, deviceid_in);
         goto finally;
     }
 
-    // RECORD OUT
+    // RECORD CONV
     if (recordconv) {
-        ret = record_out(soundio);
+        vector<future<int>> record_tasks;
+        record_tasks.push_back(async(launch::async, record_in, soundio, deviceid_ch0));
+        record_tasks.push_back(async(launch::async, record_in, soundio, deviceid_ch1));
+
+        // wait for all tasks to finish
+        for (auto& t : record_tasks) {
+            t.get();
+        }
+        
         goto finally;
     }
 

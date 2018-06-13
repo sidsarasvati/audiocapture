@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 2.8.9)
 project (audiocapture)
 
+set(CMAKE_CXX_FLAGS "-Wall -std=c++11")
+message("CMAKE_BUILD_TYPE is ${CMAKE_BUILD_TYPE}")
+
 # ----------------------------------------------------------
 # find all external libraries to link with
 
