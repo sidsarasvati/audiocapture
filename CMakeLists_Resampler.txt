@@ -1,0 +1,40 @@
+
+
+cmake_minimum_required(VERSION 3.2)
+project (resample)
+
+set (CMAKE_CXX_STANDARD 11)
+
+set(CMAKE_CXX_FLAGS "-Wall" CACHE INTERNAL "" FORCE)
+
+set(DSP_PATH "${PROJECT_SOURCE_DIR}/src/dsp")
+set(BIN_PATH "${PROJECT_SOURCE_DIR}/src/bin")
+
+include_directories("${PROJECT_SOURCE_DIR}/src")
+
+set(src_DSP_all
+    ${DSP_PATH}/cheby1.c++
+    ${DSP_PATH}/cheby1.h++
+    ${DSP_PATH}/directform2.h++
+    ${DSP_PATH}/resampler.c++
+    ${DSP_PATH}/resampler.h++
+)
+
+function(dsp_object_library lib_name)
+    # building an object files library prevents
+    # CMAKE from having to build all source files
+    # independently for static and shared libraries
+    add_library(${lib_name} OBJECT ${ARGN})
+    set_target_properties(${lib_name}
+        PROPERTIES
+            CXX_STANDARD 11
+            POSITION_INDEPENDENT_CODE 1)
+endfunction()
+
+
+dsp_object_library(DSP_object ${src_DSP_all})
+
+add_executable(resample_pcm
+        "${BIN_PATH}/resample_pcm.c++"
+        $<TARGET_OBJECTS:DSP_object>
+    )
