@@ -14,11 +14,9 @@
 
 #include "dsp/resampler.h++"
 
-using namespace std;
-
 #define PCM_MAX_DOUBLE 32768.0
 
-void write_header(FILE * wf, int16_t channel_count) {
+void wave_write_header(FILE * wf, int16_t channel_count) {
 
     int16_t pcm = 0x01;
     int32_t t;
@@ -37,15 +35,15 @@ void write_header(FILE * wf, int16_t channel_count) {
     fwrite32(wf,&file_size);
     fswrite (wf,"WAVE");
     fswrite (wf,"fmt ");
-    fwrite32(wf,&bitrate);
+    fwrite32(wf,&bitrate); // subchunk size
     fwrite16(wf,&pcm);
     fwrite16(wf,&channel_count);
     fwrite32(wf,&sample_rate);
-    t = (channel_count*sample_rate*bitrate)>>3;
+    t = (channel_count*sample_rate*bitrate)>>3; // bitrate
     fwrite32(wf,&t);
-    s=2;
+    s=2; // block align (bytes)
     fwrite16(wf,&s);
-    s=16;
+    s=16; // bits per sample
     fwrite16(wf,&s);
     fswrite (wf,"data");
     fwrite32(wf,&data_size);
@@ -56,6 +54,16 @@ void write_header(FILE * wf, int16_t channel_count) {
 struct RecordContext {
     struct SoundIoRingBuffer *ring_buffer;
 };
+
+/*
+
+./audiocapture \
+  --deviceid-ch0 AppleHDAEngineInput:1F,3,0,1,0:1 \
+  --deviceid-ch1 com.rogueamoeba.Loopback:EC187ACD-4D85-480C-963D-4DF1D9B1F865 | \
+  python3 -m cogito.tools.graph_compute dialog.yml | \
+  python3 -m cogito.tools.events
+
+*/
 
 static enum SoundIoFormat prioritized_formats[] = {
     SoundIoFormatFloat32NE,
@@ -209,7 +217,7 @@ static void read_callback(struct SoundIoInStream *instream, int frame_count_min,
 
 static void overflow_callback(struct SoundIoInStream *instream) {
     static int count = 0;
-    cerr << "overflow "  << ++count << endl;
+    std::cerr << "overflow "  << ++count << std::endl;
 }
 
 static int list_devices(struct SoundIo *soundio, bool verbose = false) {
@@ -268,23 +276,23 @@ int record_in(
             soundio_device_unref(device);
         }
         if (!input_device) {
-            cerr << "Input Device '" << device_id << "' not available" << endl;
+            std::cerr << "Input Device '" << device_id << "' not available" << std::endl;
             goto finally;
         }
     } else {
         int device_index = soundio_default_input_device_index(soundio);
         input_device = soundio_get_input_device(soundio, device_index);
         if (!input_device) {
-            cerr << "No Input Device Available" << endl;
+            std::cerr << "No Input Device Available" << std::endl;
             ret = 1;
             goto finally;
         }
     }
 
-    cerr << "Input Device: " << input_device->name << endl;
+    std::cerr << "Input Device: " << input_device->name << std::endl;
 
     if (input_device->probe_error) {
-        cerr << "Unable to probe device: "<< soundio_strerror(input_device->probe_error) << endl;
+        std::cerr << "Unable to probe device: "<< soundio_strerror(input_device->probe_error) << std::endl;
         return ret;
     }
 
@@ -295,7 +303,7 @@ int record_in(
 
     instream = soundio_instream_create(input_device);
     if (!instream) {
-        cerr <<  "out of memory" << endl;
+        std::cerr <<  "out of memory" << std::endl;
         ret = 1;
         goto finally;
     }
@@ -306,31 +314,31 @@ int record_in(
     instream->userdata = &rc;
 
     if ((ret = soundio_instream_open(instream))) {
-        cerr <<  "unable to open input stream: " << soundio_strerror(ret) << endl;
+        std::cerr <<  "unable to open input stream: " << soundio_strerror(ret) << std::endl;
         goto finally;
     }
 
-    cout << instream->layout.name << " " << sample_rate << "Hz "
-         << soundio_format_string(fmt) << " interleaved " << endl;
+    std::cerr << instream->layout.name << " " << sample_rate << "Hz "
+         << soundio_format_string(fmt) << " interleaved " << std::endl;
 
 
     capacity = RING_BUFFER_DURATION_SECONDS * instream->sample_rate * instream->bytes_per_frame;
     rc.ring_buffer = soundio_ring_buffer_create(soundio, capacity);
     if (!rc.ring_buffer) {
-        cerr << "out of memory" << endl;
+        std::cerr << "out of memory" << std::endl;
         ret = 1;
         goto finally;
     }
 
     if ((ret = soundio_instream_start(instream))) {
-        cerr << "unable to start input device: " << soundio_strerror(ret) << endl;
+        std::cerr << "unable to start input device: " << soundio_strerror(ret) << std::endl;
          goto finally;
     }
 
     Fs_in = static_cast<double>(sample_rate);
     resampler.init(Fs_in, Fs_out, padding);
 
-    cout << "Recording... Fs_in:" << Fs_in << " Fs_out: "<< Fs_out << endl;
+    std::cerr << "Recording... Fs_in:" << Fs_in << " Fs_out: "<< Fs_out << std::endl;
 
     sample_buffer = (double*) malloc(sizeof(double) * resampler.max_output());
 
@@ -365,8 +373,6 @@ int record_in(
             }
         }
 
-        cout << fill_bytes << " -> " << n_bytes_written << endl;
-
         soundio_ring_buffer_advance_read_ptr(rc.ring_buffer, fill_bytes);
     }
 
@@ -379,61 +385,116 @@ finally:
     return ret;
 }
 
+
+int record_main(
+    SoundIo* soundio,
+    std::vector<char*> channel_ids,
+    FILE* fout)
+{
+    std::vector<std::future<int>> channel_tasks;
+
+    std::deque<int16_t> deque_ch0;
+    std::deque<int16_t> deque_ch1;
+    std::vector<std::deque<int16_t>*> channel_deque;
+    std::mutex channel_mutex;
+
+    channel_deque = {&deque_ch0, &deque_ch1};
+    int n_available;
+
+    int16_t vi;
+
+    for (int i=0; i < channel_ids.size(); i++) {
+
+        channel_tasks.push_back(async(
+            std::launch::async,
+            record_in,
+            soundio,
+            channel_ids[i],
+            &channel_mutex,
+            channel_deque[i]));
+    }
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        {
+            std::lock_guard<std::mutex> guard(channel_mutex);
+
+            // synchronize the available bytes across all queues
+            n_available = 16000; // Fs_out * 2
+            for (int i=0; i < channel_ids.size(); i++) {
+                if (channel_deque[i]->size() < n_available) {
+                    n_available = channel_deque[i]->size();
+                }
+            }
+            if (n_available == 0) {
+                continue;
+            }
+
+            // interleave bytes from all queues
+
+            for (int i=0; i < n_available; i++) {
+                for (int j=0; j < channel_ids.size(); j++) {
+
+                    vi = channel_deque[j]->front();
+                    if (fwrite( &vi, sizeof(int16_t), 1, fout)!=1) {
+                        fprintf(stderr, "write error: %s\n", strerror(errno));
+                        return 1;
+                    }
+                    channel_deque[j]->pop_front();
+                }
+            }
+            fflush(fout);
+        }
+    }
+
+    for (auto& t : channel_tasks) {
+        t.get();
+    }
+}
+
 int main(int argc, char **argv) {
     char* exe = argv[0];
     bool listdevices = false;
     bool verbose = false;
-    bool record = false;
-    bool recordconv = false;
-    char* deviceid_in = nullptr;
     char* deviceid_ch0 = nullptr;
     char* deviceid_ch1 = nullptr;
+    char* output_name = (char*) "-";
     int ret;
     FILE* fout;
-    int n_available;
     int16_t n_channels = 0;
-    int16_t vi;
 
-    vector<future<int>> channel_tasks;
-    vector<char*> channel_ids;
-    vector<std::deque<int16_t>*> channel_deque;
-    std::deque<int16_t> deque_ch0;
-    std::deque<int16_t> deque_ch1;
-    std::mutex channel_mutex;
+    std::vector<char*> channel_ids;
 
-    // sidster: this cmd line argument parsing code is way too clever
-    // a.k.a annoying a.k.a complex; handle with care
     for (int i = 1; i < argc; i++) {
         char* arg = argv[i];
-        if (arg[0] == '-' && arg[1] == '-') {
-            if (strcmp(arg, "--listdevices") == 0) {
-                listdevices = true;
-            } else if (strcmp(arg, "--record") == 0) {
-                recordconv = true;
-                i++;
-                // find if the required arguments '--deviceid-ch0
-                // $deviceid --deviceid-ch1 $deviceid' were passed
 
-                for (int j=0; j < 2 and i < argc; j++) {
-                    if (deviceid_ch0 == nullptr && strcmp(argv[i], "--deviceid-ch0") == 0) {
-                        deviceid_ch0 = argv[++i];
-                        n_channels++;
-                        i++;
-                    } else if (deviceid_ch1 == nullptr && strcmp(argv[i], "--deviceid-ch1") == 0) {
-                        deviceid_ch1 = argv[++i];
-                        n_channels++;
-                        i++;
-                    } else {
-                        cout << argv[++i] << std::endl;
-                        return usage(exe);
-                    }
-                }
-            } else if (strcmp(arg, "--verbose") == 0) {
-                verbose = true;
+        if (strcmp(arg, "--listdevices") == 0) {
+            listdevices = true;
+            continue;
+
+        } else if (strcmp(arg, "--verbose") == 0) {
+            verbose = true;
+            continue;
+        }
+
+        // parameters which consume a value
+        if (argc > i+1) {
+            if (strcmp(arg, "--out") == 0) {
+                output_name = argv[++i];
+            } else if (deviceid_ch0 == nullptr && strcmp(arg, "--deviceid-ch0") == 0) {
+                deviceid_ch0 = argv[++i];
+                n_channels++;
+                std::cerr << "ch0: " << deviceid_ch0 << std::endl;
+            } else if (deviceid_ch1 == nullptr && strcmp(arg, "--deviceid-ch1") == 0) {
+                deviceid_ch1 = argv[++i];
+                n_channels++;
+                std::cerr << "ch1: " << deviceid_ch1 << std::endl;
             } else {
+                std::cerr << "unrecognized option a: " << arg << std::endl;
                 return usage(exe);
             }
         } else {
+            std::cerr << "unrecognized option b: " << arg << std::endl;
             return usage(exe);
         }
     }
@@ -444,7 +505,7 @@ int main(int argc, char **argv) {
     // SETUP
     struct SoundIo *soundio = soundio_create();
     if (!soundio) {
-        fprintf(stderr, "out of memory\n");
+        std::cerr << "out of memory\n" << std::endl;
         ret = 1;
         goto finally;
     }
@@ -465,94 +526,42 @@ int main(int argc, char **argv) {
     soundio_flush_events(soundio);
     // ------------
 
+
     // LIST DEVICES
     if (listdevices) {
         ret = list_devices(soundio, verbose);
         goto finally;
     }
 
-    cout << "n channels: " << n_channels << endl;
+
+    std::cerr << "n channels: " << n_channels << std::endl;
+
+    if (n_channels==0) {
+        std::cerr << "no channel configured" << std::endl;
+    }
 
     channel_ids = {deviceid_ch0, deviceid_ch1};
-    channel_deque = {&deque_ch0, &deque_ch1};
 
-    for (int i=0; i < n_channels; i++) {
+    if (strcmp(output_name, "-") == 0) {
 
-        channel_tasks.push_back(async(
-            launch::async,
-            record_in,
-            soundio,
-            channel_ids[i],
-            &channel_mutex,
-            channel_deque[i]));
-    }
+        fout = stdout;
 
-    fout = fopen("output.wav", "wb");
+    } else {
+        fout = fopen("output.wav", "wb");
 
-    if (!fout) {
-        cerr << "unable to open file: " << strerror(errno) << endl;
-        ret = 1;
-        goto finally;
-    }
-
-    write_header(fout, n_channels);
-
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-
-        {
-            std::lock_guard<std::mutex> guard(channel_mutex);
-
-            n_available = 10240;
-            for (int i=0; i < n_channels; i++) {
-                if (channel_deque[i]->size() < n_available) {
-                    n_available = channel_deque[i]->size();
-                }
-            }
-
-            if (n_available == 0) {
-                continue;
-            }
-
-            cout << "flush" << n_available << endl;
-
-            for (int i=0; i < n_available; i++) {
-                for (int j=0; j < n_channels; j++) {
-
-                    vi = channel_deque[j]->front();
-                    if (fwrite( &vi, sizeof(int16_t), 1, fout)!=1) {
-                        fprintf(stderr, "write error: %s\n", strerror(errno));
-                        return 1;
-                    }
-                    channel_deque[j]->pop_front();
-                }
-            }
-            fflush(fout);
-
+        if (!fout) {
+            std::cerr << "unable to open file: " << strerror(errno) << std::endl;
+            ret = 1;
+            goto finally;
         }
 
-
     }
 
-    for (auto& t : channel_tasks) {
-        t.get();
-    }
+    wave_write_header(fout, n_channels);
 
-    /*
-    if (recordconv) {
-        vector<future<int>> record_tasks;
-        record_tasks.push_back(async(launch::async, record_in, soundio, deviceid_ch0));
-        record_tasks.push_back(async(launch::async, record_in, soundio, deviceid_ch1));
+    record_main(soundio, channel_ids, fout);
 
-        // wait for all tasks to finish
-        for (auto& t : record_tasks) {
-            t.get();
-        }
-
-        goto finally;
-    }
-    */
-
+    fclose(fout);
 
 finally:
     if (soundio) {
