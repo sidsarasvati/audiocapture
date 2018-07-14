@@ -7,8 +7,11 @@
 class Resampler
 {
 public:
+    Resampler() {};
     Resampler(double FS_in,double FS_out, double Fs_padding);
     ~Resampler() {};
+
+    void init(double FS_in,double FS_out, double Fs_padding);
 
     int insert(double value, double* out);
     int max_output(void) const;

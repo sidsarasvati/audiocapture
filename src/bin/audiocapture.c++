@@ -8,9 +8,49 @@
 #include <unistd.h>
 #include <future>
 #include <vector>
+#include <chrono>
+#include <thread>
+
+#include "dsp/resampler.h++"
 
 using namespace std;
 
+#define PCM_MAX_DOUBLE 32768.0
+
+void write_header(FILE * wf) {
+
+    int16_t pcm = 0x01;
+    int32_t t;
+    int16_t s;
+
+    int32_t bitrate = 16;
+    int16_t channel_count = 1;
+    int32_t sample_rate = 8000;
+    int32_t file_size = 0x0FFFFFFF + 1;
+    int32_t data_size = file_size - 44 + 8;
+
+    #define fswrite(stream,str) fwrite(str,sizeof(char),strlen(str),stream)
+    #define fwrite32(stream,pl) fwrite(pl,sizeof(int32_t),1,stream)
+    #define fwrite16(stream,ps) fwrite(ps,sizeof(int16_t),1,stream)
+
+    fswrite (wf,"RIFF");
+    fwrite32(wf,&file_size);
+    fswrite (wf,"WAVE");
+    fswrite (wf,"fmt ");
+    fwrite32(wf,&bitrate);
+    fwrite16(wf,&pcm);
+    fwrite16(wf,&channel_count);
+    fwrite32(wf,&sample_rate);
+    t = (channel_count*sample_rate*bitrate)>>3;
+    fwrite32(wf,&t);
+    s=2;
+    fwrite16(wf,&s);
+    s=16;
+    fwrite16(wf,&s);
+    fswrite (wf,"data");
+    fwrite32(wf,&data_size);
+
+}
 
 // TODO - use ring buffer w/o wrapper
 struct RecordContext {
@@ -190,7 +230,7 @@ static int list_devices(struct SoundIo *soundio, bool verbose = false) {
     return 0;
 }
 
-int record_in(SoundIo* soundio, char* device_id = nullptr) {
+int record_in(SoundIo* soundio, char* device_id, FILE* fout) {
     const int RING_BUFFER_DURATION_SECONDS = 30;
     int ret = 0;
     int capacity = 0;
@@ -198,9 +238,17 @@ int record_in(SoundIo* soundio, char* device_id = nullptr) {
     struct SoundIoDevice* input_device = nullptr;
     int sample_rate = 0;
     SoundIoFormat fmt = SoundIoFormatInvalid;
-    FILE* out_f = nullptr;
     struct SoundIoInStream *instream = nullptr;
+    double padding = 1000.0;
+    double Fs_in = 44100;
+    double Fs_out = 8000.0;
+    double* sample_buffer = nullptr;
+    double v;
+    int i, j;
+    int16_t n, vi, *ptr;
+    size_t n_bytes_written;
 
+    Resampler resampler;
     // get input device
     if (device_id) {
         for (int i = 0; i < soundio_input_device_count(soundio); i += 1) {
@@ -237,13 +285,6 @@ int record_in(SoundIo* soundio, char* device_id = nullptr) {
     sample_rate = input_device->sample_rates[0].max;
     fmt = input_device->formats[0];
 
-    out_f = fopen(string(string("/tmp/recordconv-") + input_device->name + ".raw").c_str(), "wb");
-    if (!out_f) {
-        cerr << "unable to open file: " << strerror(errno) << endl;
-        ret = 1;
-        goto finally;
-    }
-
     instream = soundio_instream_create(input_device);
     if (!instream) {
         cerr <<  "out of memory" << endl;
@@ -261,7 +302,7 @@ int record_in(SoundIo* soundio, char* device_id = nullptr) {
         goto finally;
     }
 
-    cerr << instream->layout.name << " " << sample_rate << "Hz "
+    cout << instream->layout.name << " " << sample_rate << "Hz "
          << soundio_format_string(fmt) << " interleaved " << endl;
 
 
@@ -278,25 +319,55 @@ int record_in(SoundIo* soundio, char* device_id = nullptr) {
          goto finally;
     }
 
-    cout << "Recording... " << endl;
+    Fs_in = static_cast<double>(sample_rate);
+    resampler.init(Fs_in, Fs_out, padding);
+
+    cout << "Recording... Fs_in:" << Fs_in << " Fs_out: "<< Fs_out << endl;
+
+    sample_buffer = (double*) malloc(sizeof(double) * resampler.max_output());
 
     // Read from ring_buffer and write to file
     while (true) {
         soundio_flush_events(soundio);
-        sleep(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
         int fill_bytes = soundio_ring_buffer_fill_count(rc.ring_buffer);
-        char *read_buf = soundio_ring_buffer_read_ptr(rc.ring_buffer);
-        size_t amt = fwrite(read_buf, 1, fill_bytes, out_f);
-        if ((int)amt != fill_bytes) {
-            fprintf(stderr, "write error: %s\n", strerror(errno));
-            return 1;
+
+        if (fill_bytes==0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
         }
+        char *read_buf = soundio_ring_buffer_read_ptr(rc.ring_buffer);
+
+        ptr = reinterpret_cast<int16_t*>(read_buf);
+
+        n_bytes_written = 0;
+        for (i=0; i<fill_bytes/2; i+=2) {
+            v = ( (static_cast<double>(ptr[i]) / PCM_MAX_DOUBLE) +
+                  (static_cast<double>(ptr[i+1]) / PCM_MAX_DOUBLE) ) / 2.0;
+            n = resampler.insert(v, sample_buffer);
+            for (j=0; j < n; j++) {
+                // write to a deque instead
+                vi = static_cast<int16_t>(sample_buffer[j] * PCM_MAX_DOUBLE);
+                if (fwrite( &vi, sizeof(int16_t), 1, fout)!=1) {
+                    fprintf(stderr, "write error: %s\n", strerror(errno));
+                    return 1;
+                }
+                n_bytes_written++;
+            }
+        }
+
+        //cout << fill_bytes << " -> " << n_bytes_written << endl;
+
+        fflush(fout);
         soundio_ring_buffer_advance_read_ptr(rc.ring_buffer, fill_bytes);
     }
 
 finally:
     soundio_instream_destroy(instream);
     soundio_device_unref(input_device);
+    if (sample_buffer != nullptr) {
+        free(nullptr);
+    }
     return ret;
 }
 
@@ -388,11 +459,23 @@ int main(int argc, char **argv) {
 
     // RECORD
     if (record) {
-        ret = record_in(soundio, deviceid_in);
+
+        FILE * fout = fopen("output.pcm", "wb");
+
+        if (!fout) {
+            cerr << "unable to open file: " << strerror(errno) << endl;
+            ret = 1;
+            goto finally;
+        }
+
+        write_header(fout);
+
+        ret = record_in(soundio, deviceid_in, fout);
         goto finally;
     }
 
     // RECORD CONV
+    /*
     if (recordconv) {
         vector<future<int>> record_tasks;
         record_tasks.push_back(async(launch::async, record_in, soundio, deviceid_ch0));
@@ -402,9 +485,10 @@ int main(int argc, char **argv) {
         for (auto& t : record_tasks) {
             t.get();
         }
-        
+
         goto finally;
     }
+    */
 
 
 finally:
