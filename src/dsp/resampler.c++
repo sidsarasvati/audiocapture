@@ -5,13 +5,13 @@
 
 #include "dsp/resampler.h++"
 
-Resampler::Resampler(double Fs_in, double Fs_out, double Fs_padding) {
+Resampler::Resampler(double Fs_in, double Fs_out, double Fs_padding, int num_poles, int percent_ripple) {
 
-    init(Fs_in, Fs_out, Fs_padding);
+    init(Fs_in, Fs_out, Fs_padding, num_poles, percent_ripple);
 
 }
 
-void Resampler::init(double Fs_in, double Fs_out, double Fs_padding) {
+void Resampler::init(double Fs_in, double Fs_out, double Fs_padding, int num_poles, int percent_ripple) {
 
     // this requirement is some what arbitrary
     // however for low target rates this algorithm does not work very well.
@@ -25,15 +25,12 @@ void Resampler::init(double Fs_in, double Fs_out, double Fs_padding) {
 
     if (Fs_out < Fs_in) {
 
-        int num_poles_lpf = 6;
-        int percent_ripple = 15;
-
         int coeff_buf_size;
-        double* tb = newCheby1Array(num_poles_lpf, &coeff_buf_size);
-        double* ta = newCheby1Array(num_poles_lpf, &coeff_buf_size);
+        double* tb = newCheby1Array(num_poles, &coeff_buf_size);
+        double* ta = newCheby1Array(num_poles, &coeff_buf_size);
 
         double Fc = ((Fs_out/2.0)-Fs_padding)/ (Fs_in/2.0);
-        int num_coeff = cheby1(num_poles_lpf,percent_ripple, Fc, 0, tb, ta, coeff_buf_size);
+        int num_coeff = cheby1(num_poles,percent_ripple, Fc, 0, tb, ta, coeff_buf_size);
 
         m_df2 = new DirectForm2Mono<double>(tb, ta, num_coeff);
 

@@ -8,10 +8,10 @@ class Resampler
 {
 public:
     Resampler() {};
-    Resampler(double FS_in,double FS_out, double Fs_padding);
+    Resampler(double FS_in,double FS_out, double Fs_padding, int num_poles = 6, int percent_ripple = 15);
     ~Resampler() {};
 
-    void init(double FS_in,double FS_out, double Fs_padding);
+    void init(double FS_in,double FS_out, double Fs_padding, int num_poles = 6, int percent_ripple = 15);
 
     int insert(double value, double* out);
     int max_output(void) const;

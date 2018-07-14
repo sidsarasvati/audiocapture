@@ -255,7 +255,7 @@ int record_in(
     int sample_rate = 0;
     SoundIoFormat fmt = SoundIoFormatInvalid;
     struct SoundIoInStream *instream = nullptr;
-    double padding = 1000.0;
+    double padding = 500.0;
     double Fs_in = 44100;
     double Fs_out = 8000.0;
     double* sample_buffer = nullptr;
