@@ -10,6 +10,7 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <deque>
 
 #include "dsp/resampler.h++"
 
@@ -17,14 +18,13 @@ using namespace std;
 
 #define PCM_MAX_DOUBLE 32768.0
 
-void write_header(FILE * wf) {
+void write_header(FILE * wf, int16_t channel_count) {
 
     int16_t pcm = 0x01;
     int32_t t;
     int16_t s;
 
     int32_t bitrate = 16;
-    int16_t channel_count = 1;
     int32_t sample_rate = 8000;
     int32_t file_size = 0x0FFFFFFF + 1;
     int32_t data_size = file_size - 44 + 8;
@@ -115,10 +115,13 @@ static void print_channel_layout(const struct SoundIoChannelLayout *layout) {
 static void print_device(struct SoundIoDevice *device, bool is_default, bool verbose) {
     const char *default_str = is_default ? " (default)" : "";
     const char *raw_str = device->is_raw ? " (raw)" : "";
-    fprintf(stderr, "%s%s%s\n", device->name, default_str, raw_str);
+
     if (!verbose) {
+        fprintf(stderr, "%s\t(%s)\n", device->name, device->id);
         return;
     }
+
+    fprintf(stderr, "%s%s%s\n", device->name, default_str, raw_str);
 
     fprintf(stderr, "  id: %s\n", device->id);
     if (device->probe_error) {
@@ -230,7 +233,12 @@ static int list_devices(struct SoundIo *soundio, bool verbose = false) {
     return 0;
 }
 
-int record_in(SoundIo* soundio, char* device_id, FILE* fout) {
+int record_in(
+    SoundIo* soundio,
+    char* device_id,
+    std::mutex* channel_mutex,
+    std::deque<int16_t>* channel_deque)
+{
     const int RING_BUFFER_DURATION_SECONDS = 30;
     int ret = 0;
     int capacity = 0;
@@ -340,25 +348,25 @@ int record_in(SoundIo* soundio, char* device_id, FILE* fout) {
 
         ptr = reinterpret_cast<int16_t*>(read_buf);
 
-        n_bytes_written = 0;
-        for (i=0; i<fill_bytes/2; i+=2) {
-            v = ( (static_cast<double>(ptr[i]) / PCM_MAX_DOUBLE) +
-                  (static_cast<double>(ptr[i+1]) / PCM_MAX_DOUBLE) ) / 2.0;
-            n = resampler.insert(v, sample_buffer);
-            for (j=0; j < n; j++) {
-                // write to a deque instead
-                vi = static_cast<int16_t>(sample_buffer[j] * PCM_MAX_DOUBLE);
-                if (fwrite( &vi, sizeof(int16_t), 1, fout)!=1) {
-                    fprintf(stderr, "write error: %s\n", strerror(errno));
-                    return 1;
+        {
+            std::lock_guard<std::mutex> guard(*channel_mutex);
+
+            n_bytes_written = 0;
+            for (i=0; i<fill_bytes/2; i+=2) {
+                v = ( (static_cast<double>(ptr[i]) / PCM_MAX_DOUBLE) +
+                      (static_cast<double>(ptr[i+1]) / PCM_MAX_DOUBLE) ) / 2.0;
+                n = resampler.insert(v, sample_buffer);
+                for (j=0; j < n; j++) {
+                    // write to a deque instead
+                    vi = static_cast<int16_t>(sample_buffer[j] * PCM_MAX_DOUBLE);
+                    channel_deque->push_back(vi);
+                    n_bytes_written++;
                 }
-                n_bytes_written++;
             }
         }
 
-        //cout << fill_bytes << " -> " << n_bytes_written << endl;
+        cout << fill_bytes << " -> " << n_bytes_written << endl;
 
-        fflush(fout);
         soundio_ring_buffer_advance_read_ptr(rc.ring_buffer, fill_bytes);
     }
 
@@ -380,6 +388,18 @@ int main(int argc, char **argv) {
     char* deviceid_in = nullptr;
     char* deviceid_ch0 = nullptr;
     char* deviceid_ch1 = nullptr;
+    int ret;
+    FILE* fout;
+    int n_available;
+    int16_t n_channels = 0;
+    int16_t vi;
+
+    vector<future<int>> channel_tasks;
+    vector<char*> channel_ids;
+    vector<std::deque<int16_t>*> channel_deque;
+    std::deque<int16_t> deque_ch0;
+    std::deque<int16_t> deque_ch1;
+    std::mutex channel_mutex;
 
     // sidster: this cmd line argument parsing code is way too clever
     // a.k.a annoying a.k.a complex; handle with care
@@ -389,28 +409,22 @@ int main(int argc, char **argv) {
             if (strcmp(arg, "--listdevices") == 0) {
                 listdevices = true;
             } else if (strcmp(arg, "--record") == 0) {
-                record = true;
-                // find if the optional '--deviceid $deviceid'
-                // argument was passed
-                if(argc >= i+2 && strcmp(argv[++i], "--deviceid") == 0) {
-                    deviceid_in = argv[++i];
-                }
-            } else if (strcmp(arg, "--recordconv") == 0) {
                 recordconv = true;
                 i++;
                 // find if the required arguments '--deviceid-ch0
                 // $deviceid --deviceid-ch1 $deviceid' were passed
-                if (argc < i+4) {
-                    return usage(exe);
-                }
-                for (int j=0; j < 2; j++) {
-                    if (strcmp(argv[i], "--deviceid-ch0") == 0) {
+
+                for (int j=0; j < 2 and i < argc; j++) {
+                    if (deviceid_ch0 == nullptr && strcmp(argv[i], "--deviceid-ch0") == 0) {
                         deviceid_ch0 = argv[++i];
+                        n_channels++;
                         i++;
-                    } else if (strcmp(argv[i], "--deviceid-ch1") == 0) {
+                    } else if (deviceid_ch1 == nullptr && strcmp(argv[i], "--deviceid-ch1") == 0) {
                         deviceid_ch1 = argv[++i];
+                        n_channels++;
                         i++;
                     } else {
+                        cout << argv[++i] << std::endl;
                         return usage(exe);
                     }
                 }
@@ -424,7 +438,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    int ret = 0;
+    ret = 0;
 
     // -----------
     // SETUP
@@ -457,24 +471,73 @@ int main(int argc, char **argv) {
         goto finally;
     }
 
-    // RECORD
-    if (record) {
+    cout << "n channels: " << n_channels << endl;
 
-        FILE * fout = fopen("output.pcm", "wb");
+    channel_ids = {deviceid_ch0, deviceid_ch1};
+    channel_deque = {&deque_ch0, &deque_ch1};
 
-        if (!fout) {
-            cerr << "unable to open file: " << strerror(errno) << endl;
-            ret = 1;
-            goto finally;
-        }
+    for (int i=0; i < n_channels; i++) {
 
-        write_header(fout);
+        channel_tasks.push_back(async(
+            launch::async,
+            record_in,
+            soundio,
+            channel_ids[i],
+            &channel_mutex,
+            channel_deque[i]));
+    }
 
-        ret = record_in(soundio, deviceid_in, fout);
+    fout = fopen("output.wav", "wb");
+
+    if (!fout) {
+        cerr << "unable to open file: " << strerror(errno) << endl;
+        ret = 1;
         goto finally;
     }
 
-    // RECORD CONV
+    write_header(fout, n_channels);
+
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        {
+            std::lock_guard<std::mutex> guard(channel_mutex);
+
+            n_available = 10240;
+            for (int i=0; i < n_channels; i++) {
+                if (channel_deque[i]->size() < n_available) {
+                    n_available = channel_deque[i]->size();
+                }
+            }
+
+            if (n_available == 0) {
+                continue;
+            }
+
+            cout << "flush" << n_available << endl;
+
+            for (int i=0; i < n_available; i++) {
+                for (int j=0; j < n_channels; j++) {
+
+                    vi = channel_deque[j]->front();
+                    if (fwrite( &vi, sizeof(int16_t), 1, fout)!=1) {
+                        fprintf(stderr, "write error: %s\n", strerror(errno));
+                        return 1;
+                    }
+                    channel_deque[j]->pop_front();
+                }
+            }
+            fflush(fout);
+
+        }
+
+
+    }
+
+    for (auto& t : channel_tasks) {
+        t.get();
+    }
+
     /*
     if (recordconv) {
         vector<future<int>> record_tasks;
