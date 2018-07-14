@@ -11,6 +11,7 @@
 #include <chrono>
 #include <thread>
 #include <deque>
+#include <signal.h>
 
 #include "dsp/resampler.h++"
 
@@ -103,9 +104,10 @@ static int usage(char *exe) {
     fprintf(stderr, "Usage: %s [options]\n"
             "Options:\n"
             "  [--listdevices]\n"
-            "  [--record {--deviceid $deviceid}] # uses default input device if --deviceid is not passed]\n"
-            "  [--recordconv --deviceid-ch0 $deviceid-ch0 --deviceid-ch1 $deviceid-ch1]\n"
-            "  [--verbose]\n", exe);
+            "  [--verbose]\n"
+            "  --deviceid-ch0 device_id\n"
+            "  --deviceid-ch1 device_id\n"
+            "  [--out out.wav]\n", exe);
     return 1;
 }
 
@@ -289,8 +291,6 @@ int record_in(
         }
     }
 
-    std::cerr << "Input Device: " << input_device->name << std::endl;
-
     if (input_device->probe_error) {
         std::cerr << "Unable to probe device: "<< soundio_strerror(input_device->probe_error) << std::endl;
         return ret;
@@ -318,9 +318,8 @@ int record_in(
         goto finally;
     }
 
-    std::cerr << instream->layout.name << " " << sample_rate << "Hz "
-         << soundio_format_string(fmt) << " interleaved " << std::endl;
-
+    //std::cerr << instream->layout.name << " " << sample_rate << "Hz "
+    //     << soundio_format_string(fmt) << " interleaved " << std::endl;
 
     capacity = RING_BUFFER_DURATION_SECONDS * instream->sample_rate * instream->bytes_per_frame;
     rc.ring_buffer = soundio_ring_buffer_create(soundio, capacity);
@@ -338,7 +337,8 @@ int record_in(
     Fs_in = static_cast<double>(sample_rate);
     resampler.init(Fs_in, Fs_out, padding);
 
-    std::cerr << "Recording... Fs_in:" << Fs_in << " Fs_out: "<< Fs_out << std::endl;
+    fprintf(stderr, "Recording... %s (%s) Fs_in: %.0f Hz Fs_out: %.0f Hz\n",
+        input_device->name, instream->layout.name, Fs_in, Fs_out);
 
     sample_buffer = (double*) malloc(sizeof(double) * resampler.max_output());
 
@@ -359,6 +359,7 @@ int record_in(
         {
             std::lock_guard<std::mutex> guard(*channel_mutex);
 
+            // TODO: this assume stereo audio, if mono, no need to avg values
             n_bytes_written = 0;
             for (i=0; i<fill_bytes/2; i+=2) {
                 v = ( (static_cast<double>(ptr[i]) / PCM_MAX_DOUBLE) +
@@ -452,6 +453,11 @@ int record_main(
     }
 }
 
+void signal_handler(int signal) {
+    fprintf(stderr, "Caught signal %d\n", signal);
+    exit(1);
+}
+
 int main(int argc, char **argv) {
     char* exe = argv[0];
     bool listdevices = false;
@@ -462,8 +468,16 @@ int main(int argc, char **argv) {
     int ret;
     FILE* fout;
     int16_t n_channels = 0;
+    struct sigaction sigIntHandler;
 
     std::vector<char*> channel_ids;
+
+    sigIntHandler.sa_handler = signal_handler;
+    sigemptyset(&sigIntHandler.sa_mask);
+    sigIntHandler.sa_flags = 0;
+
+    sigaction(SIGINT, &sigIntHandler, NULL);
+    sigaction(SIGTERM, &sigIntHandler, NULL);
 
     for (int i = 1; i < argc; i++) {
         char* arg = argv[i];
@@ -475,6 +489,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(arg, "--verbose") == 0) {
             verbose = true;
             continue;
+        } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            return usage(exe);
         }
 
         // parameters which consume a value
@@ -490,11 +506,11 @@ int main(int argc, char **argv) {
                 n_channels++;
                 std::cerr << "ch1: " << deviceid_ch1 << std::endl;
             } else {
-                std::cerr << "unrecognized option a: " << arg << std::endl;
+                std::cerr << "unrecognized option: " << arg << std::endl;
                 return usage(exe);
             }
         } else {
-            std::cerr << "unrecognized option b: " << arg << std::endl;
+            std::cerr << "unrecognized option: " << arg << std::endl;
             return usage(exe);
         }
     }
@@ -533,11 +549,14 @@ int main(int argc, char **argv) {
         goto finally;
     }
 
-
-    std::cerr << "n channels: " << n_channels << std::endl;
-
     if (n_channels==0) {
-        std::cerr << "no channel configured" << std::endl;
+        std::cerr << "no device id configured for capture" << std::endl;
+        goto finally;
+    }
+
+    if (deviceid_ch0 == nullptr) {
+        std::cerr << "channel 0 device id not set" << std::endl;
+        goto finally;
     }
 
     channel_ids = {deviceid_ch0, deviceid_ch1};
@@ -547,7 +566,7 @@ int main(int argc, char **argv) {
         fout = stdout;
 
     } else {
-        fout = fopen("output.wav", "wb");
+        fout = fopen(output_name, "wb");
 
         if (!fout) {
             std::cerr << "unable to open file: " << strerror(errno) << std::endl;
